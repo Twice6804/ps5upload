@@ -10,7 +10,8 @@
 //! Listens on 0.0.0.0:19113 by default (set PS5UPLOAD_ENGINE_PORT env var to override).
 //! API routes are LAN-guarded via the `loopback_guard` middleware — only
 //! `/pkg-host/*` accepts off-loopback peers (so the PS5 can fetch fakepkg
-//! bytes during install). Everything else 403s any non-loopback source.
+//! bytes during install). Everything else 403s any non-loopback source,
+//! except the single extra IP in PS5UPLOAD_ALLOW_IP (for a remote client).
 //! Historical note: this was `9114` through 2.1.x, but `9114` is also the
 //! PS5-payload management port. The two live on different machines so
 //! no real collision — but the shared number confused users and logs.
@@ -456,18 +457,30 @@ async fn log_requests(req: Request, next: Next) -> axum::response::Response {
     resp
 }
 
+/// Config for `loopback_guard`: one extra IP allowed besides loopback.
+#[derive(Clone, Copy)]
+struct LoopbackGuardConfig {
+    allowed_ip: Option<std::net::IpAddr>,
+}
+
+/// Pure allow/deny decision so it can be unit-tested without a live server.
+/// Allow when the path is the PS5-facing `/pkg-host/*`, the peer is on
+/// loopback, or the peer matches the one configured `allowed_ip`.
+fn loopback_allows(cfg: &LoopbackGuardConfig, peer: std::net::IpAddr, path: &str) -> bool {
+    const OFF_LOOPBACK_ALLOWED: &[&str] = &["/pkg-host/"];
+    OFF_LOOPBACK_ALLOWED.iter().any(|p| path.starts_with(p))
+        || peer.is_loopback()
+        || Some(peer) == cfg.allowed_ip
+}
+
 async fn loopback_guard(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    State(cfg): State<LoopbackGuardConfig>,
     req: Request,
     next: Next,
 ) -> impl IntoResponse {
-    // Whitelisted off-loopback path prefixes. Keep this list tight.
-    const OFF_LOOPBACK_ALLOWED: &[&str] = &["/pkg-host/"];
     let path = req.uri().path();
-    if OFF_LOOPBACK_ALLOWED.iter().any(|p| path.starts_with(p)) {
-        return next.run(req).await.into_response();
-    }
-    if peer.ip().is_loopback() {
+    if loopback_allows(&cfg, peer.ip(), path) {
         return next.run(req).await.into_response();
     }
     eprintln!("[ps5upload-engine] refusing off-loopback request to {path} from {peer}");
@@ -5406,6 +5419,10 @@ pub struct EngineConfig {
     /// (desktop sidecar) instead of returning `Err` (mobile, where
     /// exiting would kill the whole app).
     pub exit_on_error: bool,
+    /// One extra IP allowed past the loopback guard (besides loopback),
+    /// set from `PS5UPLOAD_ALLOW_IP`. Lets a remote desktop client reach
+    /// the `/api/*` surface when self-hosting the engine.
+    pub allow_ip: Option<std::net::IpAddr>,
 }
 
 /// Core server entry. Builds the router, binds, and serves until
@@ -5422,6 +5439,9 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     ps5upload_core::log::set_sink(|msg| engine_log::record("info", msg.to_string()));
 
     let ps5_addr = cfg.ps5_addr.clone();
+    let guard_cfg = LoopbackGuardConfig {
+        allowed_ip: cfg.allow_ip,
+    };
 
     // 2048, not 512: one process fans events for up to 12 consoles, and
     // a lagging SSE consumer that falls more than `capacity` behind
@@ -5559,7 +5579,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         // guard outermost, an off-loopback peer hitting any
         // non-`/pkg-host/*` route is rejected immediately, before
         // CORS / body-limit / handler.
-        .layer(middleware::from_fn(loopback_guard));
+        .layer(middleware::from_fn_with_state(guard_cfg, loopback_guard));
 
     // Bind `0.0.0.0` so the PS5 can fetch `/pkg-host/*` for fakepkg
     // installs. The loopback-guard middleware (above) gates every
@@ -5693,6 +5713,11 @@ pub async fn run_cli() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(19113);
     let ps5_addr = std::env::var("PS5_ADDR").unwrap_or_else(|_| "192.168.137.2:9113".to_string());
+    // One extra IP allowed past the loopback guard (e.g. a remote desktop
+    // client reaching a self-hosted engine). Unparseable/unset → None.
+    let allow_ip = std::env::var("PS5UPLOAD_ALLOW_IP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
     // `run` calls `process::exit` directly on failure here
     // (exit_on_error = true), so the returned Result is only `Ok(())`
     // on normal graceful shutdown.
@@ -5701,6 +5726,7 @@ pub async fn run_cli() {
         ps5_addr,
         parent_watch: true,
         exit_on_error: true,
+        allow_ip,
     })
     .await;
 }
@@ -5717,8 +5743,47 @@ pub async fn serve_in_process(bind: &str, ps5_addr: String) -> anyhow::Result<()
         ps5_addr,
         parent_watch: false,
         exit_on_error: false,
+        allow_ip: None,
     })
     .await
+}
+
+#[cfg(test)]
+mod loopback_guard_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_always_allowed() {
+        let cfg = LoopbackGuardConfig { allowed_ip: None };
+        assert!(loopback_allows(&cfg, ip("127.0.0.1"), "/api/jobs"));
+        assert!(loopback_allows(&cfg, ip("::1"), "/api/jobs"));
+    }
+
+    #[test]
+    fn off_loopback_denied_without_allowlist() {
+        let cfg = LoopbackGuardConfig { allowed_ip: None };
+        assert!(!loopback_allows(&cfg, ip("192.168.1.50"), "/api/jobs"));
+    }
+
+    #[test]
+    fn configured_ip_allowed_others_denied() {
+        let cfg = LoopbackGuardConfig {
+            allowed_ip: Some(ip("192.168.1.50")),
+        };
+        assert!(loopback_allows(&cfg, ip("192.168.1.50"), "/api/jobs"));
+        assert!(!loopback_allows(&cfg, ip("192.168.1.51"), "/api/jobs"));
+    }
+
+    #[test]
+    fn pkg_host_allowed_from_any_peer() {
+        let cfg = LoopbackGuardConfig { allowed_ip: None };
+        assert!(loopback_allows(&cfg, ip("10.0.0.7"), "/pkg-host/abc"));
+    }
 }
 
 #[cfg(test)]
